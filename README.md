@@ -267,3 +267,108 @@ Contributions are welcome. Please open an issue or pull request for bug fixes, n
   year={2026}
 }
 ```
+
+## 📥 Collecting Training Data for SFT
+
+PlanBench-XL can double as a high-quality data collector for supervised fine-tuning (SFT) of tool-use and long-horizon planning agents.
+
+The collector captures exact `messages` (chat history) and `tools` (OpenAI function calling schema) at every LLM decision point, producing records ready for `apply_chat_template` or OpenAI fine-tuning.
+
+### Enabling Collection
+
+Use the `--collect` flag (auto-enables in config):
+
+```bash
+python -m env.run \
+  --run_config src/env/config/runs/retail/collect-example.yaml \
+  --collect \
+  --sample 10
+```
+
+Or set in any run YAML:
+
+```yaml
+data_collection:
+  enabled: true
+  output_subdir: "collect"
+  format: "openai_chat"
+  log_per_turn: true
+  log_full_trajectories: true
+  include_metadata: true
+  use_native_tools: false   # future: record as native tool_calls
+```
+
+### Output Structure
+
+Collection writes under `outputs/<run_id>/collect/` (or custom `output_subdir`):
+
+```
+collect/
+└── queries/
+    └── <query_id>/
+        ├── turn_001.json
+        ├── turn_002.json
+        ├── turns.jsonl          # one JSON record per LLM turn
+        └── trajectory.json      # full per-query trajectory (when enabled)
+```
+
+Example record in `turns.jsonl`:
+
+```json
+{
+  "turn_id": 3,
+  "query_id": "retail_query_0058",
+  "step": 3,
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "Help me plan..."},
+    {"role": "assistant", "content": "<tool_call>...</tool_call>"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_product_info",
+        "description": "...",
+        "parameters": { "type": "object", ... }
+      }
+    }
+  ],
+  "raw_response": "...",
+  "metadata": {
+    "data_collection": true,
+    "format": "openai_chat",
+    ...
+  }
+}
+```
+
+Full trajectories include the complete history and final result.
+
+### Using the Collected Data
+
+1. The format is compatible with OpenAI chat completions (messages + tools).
+2. For SFT, apply your target model's chat template (e.g. via Hugging Face `AutoTokenizer.apply_chat_template`).
+3. Filter by success, length, or quality as needed.
+
+Example (future helper script in `scripts/`):
+
+```bash
+# After collection
+python scripts/collect_to_sft.py --input outputs/.../collect --model <hf-model-id>
+```
+
+### Preserving Benchmark Mode
+
+All existing benchmark commands continue to work unchanged when `data_collection.enabled` is false (default).
+
+Collection adds minimal overhead and never breaks resume/evaluation.
+
+### Next Steps
+
+- Post-processing scripts for SFT-ready JSONL
+- Native `tools=` / `tool_calls` dual-mode support
+- Integration with `sft-data-preparation` pipelines
+
+See the implementation plan: `.hermes/plans/2026-07-02-PlanBench-XL-Training-Data-Collection.md`
+

@@ -1575,103 +1575,122 @@ class EnvRunner:
         return results
 
 
+    def _to_openai_tools(self, tool_names: list[str]) -> list[dict[str, Any]]:
+        """Convert currently available tool names to clean OpenAI function schema, no PlanBench extras."""
+        tools = []
+        for name in tool_names:
+            tool = self.tool_registry.get(name)
+            if not isinstance(tool, dict):
+                continue
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", name),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", tool.get("input_schema", {})) or {},
+                },
+            })
+        return tools
+
     def _log_collection_turn(
         self,
-        query: "QuerySpec",
+        query: QuerySpec,
         turn_id: int,
         history: list[dict[str, str]],
         raw_response: str,
-        state: "AgentState",
+        state: AgentState,
     ) -> None:
-        if not self.config.data_collection.enabled:
-            return
         dc = self.config.data_collection
-        collect_dir = self.config.output.output_dir / dc.output_subdir
-        collect_dir.mkdir(parents=True, exist_ok=True)
+        if not dc.enabled:
+            return
+        if not dc.log_per_turn and not dc.log_full_trajectories:
+            return
 
-        # Build OpenAI-style messages (history is already list of role/content)
-        messages = []
-        for h in history:
-            role = h.get("role", "user")
-            content = h.get("content", "")
-            messages.append({"role": role, "content": content})
-
-        # Add the assistant response
+        messages = [{"role": h.get("role", "user"), "content": h.get("content", "")} for h in history]
         messages.append({"role": "assistant", "content": raw_response})
 
-        # Current tools (convert tool_registry to clean OpenAI schema)
-        tools = []
-        for name, tool in getattr(self, "tool_registry", {}).items():
-            if isinstance(tool, dict) and tool.get("type") == "function":
-                fn = tool.get("function", {})
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": fn.get("name", name),
-                        "description": fn.get("description", ""),
-                        "parameters": fn.get("parameters", {}),
-                    }
-                })
-            elif isinstance(tool, dict):
-                # fallback
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name", name),
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("parameters", tool.get("input_schema", {})),
-                    }
-                })
+        # In native tool mode, include the current tool batch the model had access to.
+        # In prompted mode, the model sees tool schemas embedded in history messages—tools list stays empty.
+        tools = self._to_openai_tools(state.available_tool_names) if dc.use_native_tools else []
 
-        record = {
+        record: dict[str, Any] = {
             "turn_id": turn_id,
             "query_id": query.query_id,
             "step": state.total_step_count,
             "messages": messages,
             "tools": tools,
-            "raw_response": raw_response,
-            "metadata": {
-                "data_collection": True,
-                "format": dc.format,
-                "use_native_tools": dc.use_native_tools,
-                "include_metadata": dc.include_metadata,
-            }
         }
 
-        # Per query file for simplicity
-        qdir = collect_dir / "queries" / query.query_id
-        qdir.mkdir(parents=True, exist_ok=True)
-        turn_path = qdir / f"turn_{turn_id:03d}.json"
-        dump_json(turn_path, record)
+        if dc.include_metadata:
+            record["metadata"] = {
+                "run_id": self.config.run_id,
+                "domain": self.config.domain,
+                "model": self.config.model.model_name,
+                "format": dc.format,
+                "timestamp": now_utc_iso(),
+                "available_tool_names": list(state.available_tool_names),
+                "available_tools": self._to_openai_tools(state.available_tool_names),
+            }
 
-        # Also append to a jsonl per query
+        qdir = self.config.output.output_dir / dc.output_subdir / "queries" / query.query_id
+        qdir.mkdir(parents=True, exist_ok=True)
+
+        if dc.log_per_turn:
+            dump_json(qdir / f"turn_{turn_id:03d}.json", record)
+
         jsonl_path = qdir / "turns.jsonl"
         with jsonl_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-
-    def _save_full_trajectory(self, query: "QuerySpec", final_result: dict, state: "AgentState") -> None:
-        if not (self.config.data_collection.enabled and self.config.data_collection.log_full_trajectories):
-            return
+    def _save_full_trajectory(self, query: QuerySpec, final_result: dict[str, Any], state: AgentState) -> None:
         dc = self.config.data_collection
-        collect_dir = self.config.output.output_dir / dc.output_subdir / "queries" / query.query_id
-        collect_dir.mkdir(parents=True, exist_ok=True)
+        if not dc.enabled or not dc.log_full_trajectories:
+            return
 
-        traj = {
+        if dc.filter_success_only and final_result.get("status") != "success":
+            return
+
+        if dc.max_trajectories is not None:
+            with self._collection_lock:
+                if self._collection_trajectory_count >= dc.max_trajectories:
+                    return
+                self._collection_trajectory_count += 1
+
+        qdir = self.config.output.output_dir / dc.output_subdir / "queries" / query.query_id
+        qdir.mkdir(parents=True, exist_ok=True)
+
+        turns: list[dict[str, Any]] = []
+        jsonl_path = qdir / "turns.jsonl"
+        if jsonl_path.exists():
+            with jsonl_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            turns.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+
+        trajectory: dict[str, Any] = {
             "query_id": query.query_id,
-            "run_id": self.config.run_id,
-            "final_result": final_result,
-            "total_steps": state.total_step_count,
-            "success": final_result.get("status") == "success",
-            "metadata": {
-                "format": dc.format,
-                "include_metadata": dc.include_metadata,
-            },
-            "turns_file": str(collect_dir / "turns.jsonl"),
+            "status": final_result.get("status"),
+            "steps": final_result.get("steps"),
+            "final_answer": final_result.get("final_answer"),
+            "turns": turns,
         }
+        if final_result.get("failure_reason_detail") is not None:
+            trajectory["failure_reason_detail"] = final_result["failure_reason_detail"]
+        if dc.include_metadata:
+            trajectory["metadata"] = {
+                "run_id": self.config.run_id,
+                "domain": self.config.domain,
+                "model": self.config.model.model_name,
+                "format": dc.format,
+                "turn_count": len(turns),
+                "timestamp": now_utc_iso(),
+            }
 
-        path = collect_dir / "trajectory.json"
-        dump_json(path, traj)
+        dump_json(qdir / "trajectory.json", trajectory)
 
     def _write_result_jsonl(self, results: list[dict[str, Any]], output_dir: Path) -> None:
         result_path = output_dir / "result.jsonl"

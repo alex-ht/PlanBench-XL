@@ -367,3 +367,16 @@ This plan makes implementation obvious. All paths, commands, and sketches are co
 - grok-build / writing-plans / plan skills
 
 **Next:** Review plan → explicit "Go" / approval for specific task or full delegation.
+
+
+---
+**Progress Update (2026-07-02):**
+
+- Tasks 1-3: Completed (hygiene, run.py CLI with --collect by Claude + manual, DataCollectionConfig + example YAML).
+- Tasks 4-5 (runner instrumentation): Core implemented. `_log_collection_turn` + hook after every `llm_client.generate`. Captures `messages` + `tools` (OpenAI schema) + raw response. Per-turn JSON + JSONL + optional `trajectory.json` for full trajectories.
+- Full trajectory support added in `_finalize_query`.
+- Verified via direct unit smoke + integration test (messages/tools/trajectory files produced correctly).
+- Documentation: Added "📥 Collecting Training Data for SFT" section to README.md.
+- Commits on collect branch include feature work + verification.
+
+Core collector is functional. Next: post-processing to SFT, native tools dual-mode, batch integration.
