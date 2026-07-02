@@ -361,6 +361,8 @@ class EnvRunner:
             tool_call_format_instructions=self._build_tool_call_format_instructions(),
             tool_call_identifier_rules=self._build_tool_call_identifier_rules(),
         )
+        self._collection_trajectory_count: int = 0
+        self._collection_lock = Lock()
 
     def _progress_label(self) -> str:
         output_dir = self.config.output.output_dir
@@ -1210,6 +1212,14 @@ class EnvRunner:
                     item["unresolved_turn_id"] = None
                     break
             dump_json(index_path, index)
+
+        # Data collection: full trajectory if enabled
+        if getattr(self.config, "data_collection", None) and self.config.data_collection.enabled and self.config.data_collection.log_full_trajectories:
+            try:
+                self._save_full_trajectory(query, result, state)
+            except Exception:
+                pass
+
         return result
 
     def _initial_query_progress(self, query: QuerySpec) -> dict[str, Any]:
@@ -1618,11 +1628,13 @@ class EnvRunner:
             "query_id": query.query_id,
             "step": state.total_step_count,
             "messages": messages,
-            "tools": tools if dc.use_native_tools or True else [],
+            "tools": tools,
             "raw_response": raw_response,
             "metadata": {
                 "data_collection": True,
                 "format": dc.format,
+                "use_native_tools": dc.use_native_tools,
+                "include_metadata": dc.include_metadata,
             }
         }
 
@@ -1636,6 +1648,30 @@ class EnvRunner:
         jsonl_path = qdir / "turns.jsonl"
         with jsonl_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+    def _save_full_trajectory(self, query: "QuerySpec", final_result: dict, state: "AgentState") -> None:
+        if not (self.config.data_collection.enabled and self.config.data_collection.log_full_trajectories):
+            return
+        dc = self.config.data_collection
+        collect_dir = self.config.output.output_dir / dc.output_subdir / "queries" / query.query_id
+        collect_dir.mkdir(parents=True, exist_ok=True)
+
+        traj = {
+            "query_id": query.query_id,
+            "run_id": self.config.run_id,
+            "final_result": final_result,
+            "total_steps": state.total_step_count,
+            "success": final_result.get("status") == "success",
+            "metadata": {
+                "format": dc.format,
+                "include_metadata": dc.include_metadata,
+            },
+            "turns_file": str(collect_dir / "turns.jsonl"),
+        }
+
+        path = collect_dir / "trajectory.json"
+        dump_json(path, traj)
 
     def _write_result_jsonl(self, results: list[dict[str, Any]], output_dir: Path) -> None:
         result_path = output_dir / "result.jsonl"
