@@ -93,6 +93,7 @@ class RuntimeConfig:
 class LLMResponse:
     content: str | None
     tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None  # e.g. DeepSeek reasoning_content, Qwen thinking, etc.
 
 
 @dataclass(slots=True)

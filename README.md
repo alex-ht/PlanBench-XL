@@ -85,6 +85,9 @@ Python 3.10 or newer is recommended. Run commands from the repository root.
 
 ### Running the Benchmark
 
+> **Note:** Commands are run from the repository root. The `python src/env/run.py` form (and the batch script) work out of the box.  
+> To use the module form: `PYTHONPATH=src python -m env.run ...`
+
 Run one YAML configuration:
 
 ```bash
@@ -247,7 +250,7 @@ To add a new model:
 1. Add a model YAML under `src/env/config/models/openai/`.
 2. Register it in `src/env/config/model_registry.yaml`.
 3. Add one or more run YAMLs under `src/env/config/runs/retail/<model-name>/`.
-4. Run with `python src/env/run.py --run_config <your-run-yaml>`.
+4. Run with `python src/env/run.py --run_config <your-run-yaml>` (or `PYTHONPATH=src python -m env.run ...`).
 
 The current code release targets the retail domain.
 
@@ -279,7 +282,7 @@ The collector captures exact `messages` (chat history) and `tools` (OpenAI funct
 Use the `--collect` flag (auto-enables in config):
 
 ```bash
-python -m env.run \
+PYTHONPATH=src python -m env.run \
   --run_config src/env/config/runs/retail/collect-example.yaml \
   --collect \
   --sample 10

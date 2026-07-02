@@ -1,0 +1,35 @@
+model_id: openai_deepseek_v4_pro
+provider: openai
+api_style: chat_completions
+model_name: deepseek-v4-pro
+
+auth:
+  api_key_env: OPENAI_API_KEY
+  base_url_env: OPENAI_BASE_URL
+  organization_env: OPENAI_ORG_ID
+
+request:
+  # --- DeepSeek Thinking Mode settings (preset for deepseek-v4-pro) ---
+  # See: https://api-docs.deepseek.com/guides/thinking_mode
+  # These are required to enable chain-of-thought (reasoning_content) on DeepSeek (including Azure endpoints)
+  temperature: 0.0          # Ignored by DeepSeek thinking mode
+  max_tokens: 8192
+  timeout_seconds: 600
+  max_retries: 3
+  reasoning_effort: "high"  # "high" or "max" — preset for thinking mode on Azure/official DeepSeek
+
+limits:
+  max_concurrent_requests: 16
+
+capabilities:
+  tool_calling: false
+  json_mode: false
+  reasoning: true
+  # === Azure DeepSeek (alex-g4) specific ===
+  # Do NOT send "thinking": {"type": "enabled"}  → 400 unrecognized request argument
+  # Just set reasoning_effort + this flag is enough.
+  # Verified with direct curl against https://alex-g4.services.ai.azure.com/openai/v1
+
+  # chat_template_kwargs:
+  #   enable_thinking: true   # only for certain other proxies
+

@@ -6,6 +6,42 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Ensure local 'env' package is importable when running this file directly
+# (e.g. `python src/env/run.py`) without PYTHONPATH set.
+# For `python -m env.run`, users should use: PYTHONPATH=src python -m env.run ...
+_this_file = Path(__file__).resolve()
+_src_dir = _this_file.parents[1]  # .../src/env/run.py -> .../src
+if str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
+
+# Guard against the ancient third-party 'env' package (kennethreitz/env 0.1.0)
+# which uses Python 2 syntax and shadows this project.
+try:
+    import env as _env
+    # Local package provides submodules like env.core; bad one has env.prefix + no subpackages
+    import env.core  # will fail for the PyPI 'env' package
+except ImportError as _e:
+    _bad = False
+    if "env.core" in str(_e):
+        _bad = True
+    else:
+        try:
+            if _env is not None and not hasattr(_env, "core") and hasattr(_env, "prefix"):
+                _bad = True
+        except NameError:
+            pass
+    if _bad:
+        raise RuntimeError(
+            "Conflicting 'env' package detected (the PyPI 'env' 0.1.0 by Kenneth Reitz).\n"
+            "It is Python 2 only and must be removed:\n"
+            "    pip uninstall env\n"
+            "This project provides its own 'env' package under src/."
+        ) from _e
+except RuntimeError:
+    raise
+except Exception:
+    pass
+
 from env.core.config import load_config
 from env.core.sampling import sample_sequence
 from env.domains.executor import DomainToolExecutor

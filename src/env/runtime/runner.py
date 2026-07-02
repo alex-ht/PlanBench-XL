@@ -633,7 +633,7 @@ class EnvRunner:
                 state.steps_trace.append(
                     {"step_id": next_turn_id, "action": "others", "raw_output": raw_response}
                 )
-                history = self._append_turn_messages(history, raw_response, feedback)
+                history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=llm_response.reasoning_content)
                 self._mark_turn_completed(
                     query.query_id,
                     next_turn_id,
@@ -642,6 +642,7 @@ class EnvRunner:
                     feedback,
                     state,
                     history,
+                    reasoning_content=llm_response.reasoning_content,
                 )
                 if state.label_error_cnt >= self.config.runtime.max_label_errors:
                     return self._finalize_query(query, state, None, "exceeded_max_label_errors")
@@ -651,17 +652,17 @@ class EnvRunner:
             state.label_error_cnt = 0
 
             if action == "retrieve_tools":
-                final = self._handle_retrieve(query, raw_response, content or "", next_turn_id, state, history)
+                final = self._handle_retrieve(query, raw_response, content or "", next_turn_id, state, history, reasoning_content=llm_response.reasoning_content)
                 history = final["history"]
                 if final["done"]:
                     return final["result"]
             elif action == "tool_call":
-                final = self._handle_tool_call(query, raw_response, content or "", next_turn_id, state, history)
+                final = self._handle_tool_call(query, raw_response, content or "", next_turn_id, state, history, reasoning_content=llm_response.reasoning_content)
                 history = final["history"]
                 if final["done"]:
                     return final["result"]
             else:
-                final = self._handle_final_answer(query, raw_response, content or "", next_turn_id, state, history)
+                final = self._handle_final_answer(query, raw_response, content or "", next_turn_id, state, history, reasoning_content=llm_response.reasoning_content)
                 history = final["history"]
                 self._mark_turn_completed(
                     query.query_id,
@@ -671,6 +672,7 @@ class EnvRunner:
                     final["feedback"],
                     state,
                     history,
+                    reasoning_content=llm_response.reasoning_content,
                 )
                 if final["done"]:
                     return final["result"]
@@ -686,7 +688,8 @@ class EnvRunner:
         content: str,
         step_id: int,
         state: AgentState,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
+        reasoning_content: str | None = None,
     ) -> dict[str, Any]:
         state.retrieval_attempt_count += 1
         parse_ok, request = parse_retrieve_action(content)
@@ -700,7 +703,7 @@ class EnvRunner:
             state.steps_trace.append(
                 {"step_id": step_id, "action": "retrieve_tools", "parse_ok": False, "raw_output": raw_response}
             )
-            history = self._append_turn_messages(history, raw_response, feedback)
+            history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=reasoning_content)
             self._mark_turn_completed(
                 query.query_id,
                 step_id,
@@ -729,7 +732,7 @@ class EnvRunner:
                     "request": request,
                 }
             )
-            history = self._append_turn_messages(history, raw_response, feedback)
+            history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=reasoning_content)
             self._mark_turn_completed(
                 query.query_id,
                 step_id,
@@ -782,7 +785,7 @@ class EnvRunner:
                 "retrieval_result": {"tool_count": len(trace_tools), "tools": trace_tools},
             }
         )
-        history = self._append_turn_messages(history, raw_response, feedback)
+        history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=reasoning_content)
         self._mark_turn_completed(
             query.query_id,
             step_id,
@@ -791,6 +794,7 @@ class EnvRunner:
             feedback,
             state,
             history,
+            reasoning_content=reasoning_content,
         )
         return {"done": False, "result": None, "history": history}
 
@@ -801,7 +805,8 @@ class EnvRunner:
         content: str,
         step_id: int,
         state: AgentState,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
+        reasoning_content: str | None = None,
     ) -> dict[str, Any]:
         state.tool_call_attempt_count += 1
         parse_ok, payload = parse_tool_call_action(content)
@@ -815,7 +820,7 @@ class EnvRunner:
             state.steps_trace.append(
                 {"step_id": step_id, "action": "call_tool", "parse_ok": False, "raw_output": raw_response}
             )
-            history = self._append_turn_messages(history, raw_response, feedback)
+            history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=reasoning_content)
             self._mark_turn_completed(
                 query.query_id,
                 step_id,
@@ -851,6 +856,7 @@ class EnvRunner:
                 feedback,
                 state,
                 history,
+                reasoning_content=reasoning_content,
             )
 
         surface_argument_to_datatype = tool_spec.get("surface_argument_to_datatype") or {}
@@ -876,6 +882,7 @@ class EnvRunner:
                 feedback,
                 state,
                 history,
+                reasoning_content=reasoning_content,
             )
 
         canonical_arguments = {
@@ -899,6 +906,7 @@ class EnvRunner:
                 feedback,
                 state,
                 history,
+                reasoning_content=reasoning_content,
                 trace_extra={
                     "internal_error_type": "untrusted_input_rejected"
                     if untrusted_input_datatypes
@@ -919,6 +927,7 @@ class EnvRunner:
                 feedback,
                 state,
                 history,
+                reasoning_content=reasoning_content,
                 trace_extra={"blocked": True, "blocked_tool_name": tool_name},
             )
 
@@ -945,7 +954,7 @@ class EnvRunner:
                 },
             }
         )
-        history = self._append_turn_messages(history, raw_response, feedback)
+        history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=reasoning_content)
         self._mark_turn_completed(
             query.query_id,
             step_id,
@@ -954,6 +963,7 @@ class EnvRunner:
             feedback,
             state,
             history,
+            reasoning_content=reasoning_content,
         )
         return {"done": False, "result": None, "history": history}
 
@@ -973,6 +983,8 @@ class EnvRunner:
         assistant_msg: dict[str, Any] = {"role": "assistant"}
         if llm_response.content:
             assistant_msg["content"] = llm_response.content
+        if llm_response.reasoning_content:
+            assistant_msg["reasoning_content"] = llm_response.reasoning_content
         assistant_msg["tool_calls"] = tool_calls
 
         tool_result_messages: list[dict[str, Any]] = []
@@ -1075,6 +1087,7 @@ class EnvRunner:
             combined_feedback,
             state,
             new_history,
+            reasoning_content=llm_response.reasoning_content,
         )
 
         if state.call_error_cnt >= self.config.runtime.max_call_errors:
@@ -1093,7 +1106,8 @@ class EnvRunner:
         payload: dict[str, Any],
         feedback: str,
         state: AgentState,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
+        reasoning_content: str | None = None,
         trace_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         trace_entry = {
@@ -1105,7 +1119,7 @@ class EnvRunner:
         if trace_extra:
             trace_entry.update(trace_extra)
         state.steps_trace.append(trace_entry)
-        history = self._append_turn_messages(history, raw_response, feedback)
+        history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=reasoning_content)
         self._mark_turn_completed(
             query.query_id,
             step_id,
@@ -1126,7 +1140,8 @@ class EnvRunner:
         content: str,
         step_id: int,
         state: AgentState,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
+        reasoning_content: str | None = None,
     ) -> dict[str, Any]:
         final_answer = content.strip()
         answer_correct = self.answer_judge.is_correct(query.correct_answer, final_answer)
@@ -1159,7 +1174,7 @@ class EnvRunner:
             trace_entry["incorrect_final_answer_feedback_count"] = state.incorrect_final_answer_feedback_count
             state.steps_trace.append(trace_entry)
             feedback = self._format_incorrect_final_answer_feedback()
-            history = self._append_turn_messages(history, raw_response, feedback)
+            history = self._append_turn_messages(history, raw_response, feedback, reasoning_content=reasoning_content)
             return {"done": False, "result": None, "history": history, "feedback": feedback}
 
         state.steps_trace.append(trace_entry)
@@ -1170,7 +1185,10 @@ class EnvRunner:
                 result = self._finalize_query(query, state, final_answer, "target_datatype_not_reached")
             else:
                 result = self._finalize_query(query, state, final_answer, "final_answer_wrong")
-        history = history + [{"role": "assistant", "content": raw_response}]
+        asst: dict[str, Any] = {"role": "assistant", "content": raw_response}
+        if reasoning_content:
+            asst["reasoning_content"] = reasoning_content
+        history = history + [asst]
         return {"done": True, "result": result, "history": history, "feedback": None}
 
     def _format_incorrect_final_answer_feedback(self) -> str:
@@ -1318,16 +1336,20 @@ class EnvRunner:
 
     def _append_turn_messages(
         self,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
         raw_response: str,
         feedback: str,
-    ) -> list[dict[str, str]]:
+        reasoning_content: str | None = None,
+    ) -> list[dict[str, Any]]:
         model_name = (self.config.model.model_name or "").lower()
         # feedback_role = "user" if "gemini" in model_name else "system"
         feedback_role = "user"
         feedback_prefix = "Environment feedback:\n" if feedback_role == "user" else "SYSTEM FEEDBACK:\n"
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": raw_response}
+        if reasoning_content:
+            assistant_msg["reasoning_content"] = reasoning_content
         return history + [
-            {"role": "assistant", "content": raw_response},
+            assistant_msg,
             {"role": feedback_role, "content": feedback_prefix + feedback},
         ]
 
@@ -1606,6 +1628,7 @@ class EnvRunner:
             "turn_id": turn_id,
             "status": "pending",
             "llm_raw_response": None,
+            "llm_reasoning_content": None,
             "parsed_action": None,
             "feedback_to_model": None,
             "state_after_turn": None,
@@ -1643,6 +1666,7 @@ class EnvRunner:
         feedback_to_model: Optional[str],
         state: AgentState,
         history: list[dict[str, str]],
+        reasoning_content: str | None = None,
     ) -> None:
         progress_path = self.config.output.output_dir / "progress" / "queries" / f"{query_id}.json"
         progress = load_json(progress_path)
@@ -1650,6 +1674,8 @@ class EnvRunner:
             if turn["turn_id"] == turn_id:
                 turn["status"] = "completed"
                 turn["llm_raw_response"] = raw_response if self.config.output.save_raw_llm_response else None
+                if reasoning_content:
+                    turn["llm_reasoning_content"] = reasoning_content
                 turn["parsed_action"] = parsed_action
                 turn["feedback_to_model"] = feedback_to_model
                 turn["state_after_turn"] = self._agent_state_snapshot(state)
@@ -1789,6 +1815,8 @@ class EnvRunner:
                     msg["content"] = h["content"]
                 if h.get("tool_calls"):
                     msg["tool_calls"] = h["tool_calls"]
+                if h.get("reasoning_content"):
+                    msg["reasoning_content"] = h["reasoning_content"]
                 messages.append(msg)
             elif role == "tool":
                 msg = {"role": "tool", "content": h.get("content", "")}
@@ -1804,6 +1832,8 @@ class EnvRunner:
             asst_msg["content"] = llm_response.content
         if llm_response.tool_calls:
             asst_msg["tool_calls"] = llm_response.tool_calls
+        if llm_response.reasoning_content:
+            asst_msg["reasoning_content"] = llm_response.reasoning_content
         if "content" not in asst_msg and not asst_msg.get("tool_calls"):
             asst_msg["content"] = ""
         messages.append(asst_msg)
@@ -1818,6 +1848,7 @@ class EnvRunner:
             "step": state.total_step_count,
             "messages": messages,
             "tools": tools,
+            "reasoning_content": llm_response.reasoning_content,
         }
 
         if dc.include_metadata:

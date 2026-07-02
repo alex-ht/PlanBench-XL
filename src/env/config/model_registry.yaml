@@ -8,3 +8,4 @@ openai_llama3_3_70b_local: models/openai/llama3.3-70b-local.yaml
 openai_gemini3.1_pro: models/openai/gemini-3.1-pro.yaml
 openai_gemini3.5_flash: models/openai/gemini-3.5-flash.yaml
 openai_deepseek_v4_flash: models/openai/deepseek-v4-flash.yaml
+openai_deepseek_v4_pro: models/openai/deepseek-v4-pro.yaml

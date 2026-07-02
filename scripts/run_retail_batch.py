@@ -405,6 +405,13 @@ def main() -> int:
             batch_bar.write(f"[run {index}/{total}] {display_path}")
             env = os.environ.copy()
             env.setdefault("PWMT_PROGRESS_POSITION", "1")
+            # Ensure the local src/env package can be imported as 'env'
+            src_path = str(project_root / "src")
+            if env.get("PYTHONPATH"):
+                if src_path not in env["PYTHONPATH"].split(os.pathsep):
+                    env["PYTHONPATH"] = src_path + os.pathsep + env["PYTHONPATH"]
+            else:
+                env["PYTHONPATH"] = src_path
             completed = subprocess.run(cmd, cwd=project_root, env=env)
             batch_bar.update(1)
 

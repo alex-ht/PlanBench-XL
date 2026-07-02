@@ -303,6 +303,12 @@ class LLMClient:
                 tool_calls = item.get("tool_calls")
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
+                # Only pass reasoning_content back for native tool_calls turns (per DeepSeek docs for tool calls).
+                # For prompted XML mode, we still capture it for logging but don't echo in messages to avoid 400 on some endpoints.
+                if tool_calls:
+                    reasoning = item.get("reasoning_content")
+                    if reasoning:
+                        msg["reasoning_content"] = reasoning
                 if "content" not in msg and not tool_calls:
                     msg["content"] = ""
                 messages.append(msg)
@@ -367,7 +373,10 @@ class LLMClient:
             request_kwargs["reasoning"] = reasoning
 
         response = client.responses.create(**request_kwargs)
-        return LLMResponse(content=response.output_text)
+        # Responses API reasoning is more complex (summary etc.); capture basic if available
+        reasoning = getattr(response, "reasoning", None) or getattr(response, "reasoning_content", None)
+        reasoning_text = reasoning.get("content", "") if isinstance(reasoning, dict) else None
+        return LLMResponse(content=response.output_text, reasoning_content=reasoning_text)
 
     def _generate_openai_chat_completions(
         self,
@@ -389,15 +398,34 @@ class LLMClient:
         }
         request_kwargs[token_param] = self.model.request.max_tokens
         chat_supports_temperature = self.model.capabilities.get("chat_completions_supports_temperature", True)
-        if self.model.request.temperature is not None and chat_supports_temperature:
+        if self.model.request.temperature is not None and chat_supports_temperature and not self._is_thinking_mode():
             request_kwargs["temperature"] = self.model.request.temperature
         extra_body = self._build_openai_chat_extra_body()
-        if extra_body is not None:
+        thinking_extra = self._build_deepseek_thinking_extra()
+        if thinking_extra:
+            extra_body = extra_body or {}
+            extra_body.update(thinking_extra)
+        if extra_body:
             request_kwargs["extra_body"] = extra_body
         if tools:
             request_kwargs["tools"] = tools
             request_kwargs["tool_choice"] = "auto"
-        response = client.chat.completions.create(**request_kwargs)
+
+        # Support reasoning_effort for providers that accept it on chat.completions (DeepSeek thinking mode)
+        if self.model.request.reasoning_effort:
+            request_kwargs["reasoning_effort"] = self.model.request.reasoning_effort
+
+        try:
+            response = client.chat.completions.create(**request_kwargs)
+        except Exception as e:
+            # Surface full server error for debugging (e.g. 400 reasons from thinking mode)
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    body = e.response.json()
+                    raise RuntimeError(f"Chat completions 400/err: {body}") from e
+                except Exception:
+                    raise RuntimeError(f"Chat completions error: {e.response.text}") from e
+            raise
         msg = response.choices[0].message
 
         # Normalise content: SDK returns str | None; some providers return a list of blocks.
@@ -426,9 +454,16 @@ class LLMClient:
                 for tc in msg.tool_calls
             ]
 
+        # Capture reasoning/thinking traces (DeepSeek reasoning_content, some Qwen/others)
+        reasoning_content: str | None = None
+        if hasattr(msg, "reasoning_content") and msg.reasoning_content:
+            reasoning_content = msg.reasoning_content
+        elif isinstance(getattr(msg, "model_extra", None), dict):
+            reasoning_content = msg.model_extra.get("reasoning_content") or msg.model_extra.get("thinking")
+
         if content is None and not tool_calls_raw:
             raise RuntimeError("OpenAI chat.completions returned an empty assistant message.")
-        return LLMResponse(content=content, tool_calls=tool_calls_raw)
+        return LLMResponse(content=content, tool_calls=tool_calls_raw, reasoning_content=reasoning_content)
 
     def _resolve_api_key(self, auth: Any) -> str:
         if auth.api_key:
@@ -494,6 +529,27 @@ class LLMClient:
 
         return {"chat_template_kwargs": merged_chat_template_kwargs}
 
+    def _build_deepseek_thinking_extra(self) -> dict[str, Any] | None:
+        """Build extra_body for DeepSeek Thinking Mode.
+
+        WARNING: On some Azure endpoints (e.g. alex-g4), including a top-level
+        "thinking" field causes 400 "unrecognized request argument".
+        Only enable this block for endpoints that explicitly support it.
+        For most DeepSeek-on-Azure, just setting reasoning_effort is sufficient.
+        """
+        thinking_cfg = self.model.capabilities.get("thinking")
+        if isinstance(thinking_cfg, dict) and thinking_cfg.get("type"):
+            return {"thinking": dict(thinking_cfg)}
+        return None
+
+    def _is_thinking_mode(self) -> bool:
+        """Whether this model is using DeepSeek-style thinking mode (which disallows temperature etc)."""
+        if self.model.capabilities.get("thinking"):
+            return True
+        if self.model.request.reasoning_effort:
+            return True
+        return False
+
     def _responses_model_disallows_temperature(self) -> bool:
         model_name = self.model.model_name.lower()
         return model_name.startswith("gpt-5") or model_name.startswith("o")
@@ -528,14 +584,20 @@ class LLMClient:
         }
         payload[token_param] = self.model.request.max_tokens
         chat_supports_temperature = self.model.capabilities.get("chat_completions_supports_temperature", True)
-        if self.model.request.temperature is not None and chat_supports_temperature:
+        if self.model.request.temperature is not None and chat_supports_temperature and not self._is_thinking_mode():
             payload["temperature"] = self.model.request.temperature
         extra_body = self._build_openai_chat_extra_body()
-        if extra_body is not None:
+        thinking_extra = self._build_deepseek_thinking_extra()
+        if thinking_extra:
+            extra_body = extra_body or {}
+            extra_body.update(thinking_extra)
+        if extra_body:
             payload.update(extra_body)
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if self.model.request.reasoning_effort:
+            payload["reasoning_effort"] = self.model.request.reasoning_effort
         return payload
 
     def _build_raw_chat_completions_headers(self, auth: Any) -> dict[str, str]:
@@ -666,6 +728,13 @@ class LLMClient:
         if isinstance(raw_tool_calls, list) and raw_tool_calls:
             tool_calls_raw = [tc for tc in raw_tool_calls if isinstance(tc, dict)]
 
+        # Capture reasoning/thinking traces from providers that return it (DeepSeek, etc.)
+        reasoning_content: str | None = (
+            message.get("reasoning_content")
+            or message.get("thinking")
+            or message.get("reasoning")
+        )
+
         if content is None and not tool_calls_raw:
             raise RuntimeError("chat.completions returned an empty assistant message.")
-        return LLMResponse(content=content, tool_calls=tool_calls_raw)
+        return LLMResponse(content=content, tool_calls=tool_calls_raw, reasoning_content=reasoning_content)
