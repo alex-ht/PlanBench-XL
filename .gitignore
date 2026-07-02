@@ -23,6 +23,7 @@ venv/
 # Runtime outputs
 outputs/
 progress/
+data/trajectories/
 *.jsonl
 *.log
 
