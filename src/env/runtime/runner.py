@@ -567,6 +567,12 @@ class EnvRunner:
             self._mark_turn_pending(query.query_id, next_turn_id, history, state)
             try:
                 raw_response = self.llm_client.generate(history)
+                if getattr(self.config, "data_collection", None) and self.config.data_collection.enabled:
+                    try:
+                        self._log_collection_turn(query, next_turn_id, history, raw_response, state)
+                    except Exception as _e:
+                        pass  # collection must never break the run
+
             except Exception as exc:
                 self._mark_turn_error(query.query_id, next_turn_id, str(exc))
                 return None
@@ -1557,6 +1563,79 @@ class EnvRunner:
             if final_result is not None:
                 results.append(final_result)
         return results
+
+
+    def _log_collection_turn(
+        self,
+        query: "QuerySpec",
+        turn_id: int,
+        history: list[dict[str, str]],
+        raw_response: str,
+        state: "AgentState",
+    ) -> None:
+        if not self.config.data_collection.enabled:
+            return
+        dc = self.config.data_collection
+        collect_dir = self.config.output.output_dir / dc.output_subdir
+        collect_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build OpenAI-style messages (history is already list of role/content)
+        messages = []
+        for h in history:
+            role = h.get("role", "user")
+            content = h.get("content", "")
+            messages.append({"role": role, "content": content})
+
+        # Add the assistant response
+        messages.append({"role": "assistant", "content": raw_response})
+
+        # Current tools (convert tool_registry to clean OpenAI schema)
+        tools = []
+        for name, tool in getattr(self, "tool_registry", {}).items():
+            if isinstance(tool, dict) and tool.get("type") == "function":
+                fn = tool.get("function", {})
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": fn.get("name", name),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                    }
+                })
+            elif isinstance(tool, dict):
+                # fallback
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", name),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", tool.get("input_schema", {})),
+                    }
+                })
+
+        record = {
+            "turn_id": turn_id,
+            "query_id": query.query_id,
+            "step": state.total_step_count,
+            "messages": messages,
+            "tools": tools if dc.use_native_tools or True else [],
+            "raw_response": raw_response,
+            "metadata": {
+                "data_collection": True,
+                "format": dc.format,
+            }
+        }
+
+        # Per query file for simplicity
+        qdir = collect_dir / "queries" / query.query_id
+        qdir.mkdir(parents=True, exist_ok=True)
+        turn_path = qdir / f"turn_{turn_id:03d}.json"
+        dump_json(turn_path, record)
+
+        # Also append to a jsonl per query
+        jsonl_path = qdir / "turns.jsonl"
+        with jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _write_result_jsonl(self, results: list[dict[str, Any]], output_dir: Path) -> None:
         result_path = output_dir / "result.jsonl"
