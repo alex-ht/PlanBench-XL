@@ -10,7 +10,6 @@ from env.core.types import (
     DataCollectionConfig,
     DataConfig,
     LoggingConfig,
-    DataCollectionConfig,
     ModelProfile,
     NoiseConfig,
     OutputConfig,
