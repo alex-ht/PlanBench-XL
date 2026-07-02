@@ -7,8 +7,10 @@ from typing import Any
 from env.core.types import (
     AuthConfig,
     BlockerConfig,
+    DataCollectionConfig,
     DataConfig,
     LoggingConfig,
+    DataCollectionConfig,
     ModelProfile,
     NoiseConfig,
     OutputConfig,
@@ -241,6 +243,9 @@ def load_config(
             output_dir=final_output_dir,
             save_progress_every_turn=merged["output"].get("save_progress_every_turn", True),
             save_raw_llm_response=merged["output"].get("save_raw_llm_response", True),
+        ),
+        data_collection=DataCollectionConfig(
+            **_filter_dataclass_kwargs(DataCollectionConfig, merged.get("data_collection", {}))
         ),
         logging=LoggingConfig(**_filter_dataclass_kwargs(LoggingConfig, merged.get("logging", {}))),
         merged_config=merged,

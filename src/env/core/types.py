@@ -104,9 +104,35 @@ class OutputConfig:
 
 
 @dataclass(slots=True)
+class DataCollectionConfig:
+    enabled: bool = False
+    output_subdir: str = "collect"
+    format: str = "openai_chat"
+    use_native_tools: bool = False
+    log_per_turn: bool = True
+    log_full_trajectories: bool = True
+    include_metadata: bool = True
+    max_trajectories: Optional[int] = None
+    filter_success_only: bool = False
+
+
+@dataclass(slots=True)
 class LoggingConfig:
     level: str = "INFO"
     console: bool = True
+
+
+@dataclass(slots=True)
+class DataCollectionConfig:
+    enabled: bool = False
+    output_subdir: str = "collect"
+    format: str = "openai_chat"
+    use_native_tools: bool = False
+    log_per_turn: bool = True
+    log_full_trajectories: bool = True
+    include_metadata: bool = True
+    max_trajectories: Optional[int] = None
+    filter_success_only: bool = False
 
 
 @dataclass(slots=True)
@@ -136,7 +162,9 @@ class RunnerConfig:
     runtime: RuntimeConfig
     prompt: PromptConfig
     output: OutputConfig
+    data_collection: DataCollectionConfig
     logging: LoggingConfig
+    data_collection: DataCollectionConfig
     merged_config: dict[str, Any]
 
 
