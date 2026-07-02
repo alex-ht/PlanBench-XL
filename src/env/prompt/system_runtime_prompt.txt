@@ -19,11 +19,11 @@ Domain context:
 
 At each step, take EXACTLY ONE action:
 
-1. <retrieve_tools> — discover tools  
-2. <tool_call> — call a discovered tool  
-3. <final_answer> — return the final answer  
+1. <retrieve_tools> — discover tools
+2. {tool_call_action_label} — call a discovered tool
+3. <final_answer> — return the final answer
 
-Use exactly one tag per response.
+Use exactly one action per response.
 
 ---
 

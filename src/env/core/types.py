@@ -86,6 +86,13 @@ class RuntimeConfig:
     truncate_history: bool = False
     enable_incorrect_final_answer_feedback: bool = False
     incorrect_final_answer_feedback_budget: int = 5
+    tool_calling_mode: str = "prompted_xml"  # "prompted_xml" | "native"
+
+
+@dataclass(slots=True)
+class LLMResponse:
+    content: str | None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 @dataclass(slots=True)

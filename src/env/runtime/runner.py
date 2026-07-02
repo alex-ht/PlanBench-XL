@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - optional dependency
     _tqdm = None
 
 from env.core.answer_judges import build_answer_judge, normalize_answer
-from env.core.types import AgentState, QuerySpec, RunnerConfig
+from env.core.types import AgentState, LLMResponse, QuerySpec, RunnerConfig
 from env.core.utils import compute_signature, dump_json, load_json, normalize_runtime_value, now_utc_iso
 from env.domains.executor import DomainToolExecutor
 from env.events.controller import EventController
@@ -348,6 +348,10 @@ class EnvRunner:
         self.logger = logging.getLogger("env_runner")
         self.progress_lock = Lock()
         self.use_tool_ids = bool(self.config.model.capabilities.get("tool_id_calling", False))
+        self.use_native_tools = self.config.runtime.tool_calling_mode == "native"
+        # In native mode, tool_ids are not used — the API function name is the identifier.
+        if self.use_native_tools:
+            self.use_tool_ids = False
         self.answer_judge = build_answer_judge("normalized_contains")
         self.system_prompt = self.prompt_manager.render(
             self.config.prompt.system_runtime_prompt_file,
@@ -360,6 +364,7 @@ class EnvRunner:
             max_steps=format_max_steps(self.config.runtime.max_steps),
             tool_call_format_instructions=self._build_tool_call_format_instructions(),
             tool_call_identifier_rules=self._build_tool_call_identifier_rules(),
+            tool_call_action_label=self._build_tool_call_action_label(),
         )
         self._collection_trajectory_count: int = 0
         self._collection_lock = Lock()
@@ -381,7 +386,19 @@ class EnvRunner:
     def _build_initial_user_message(self, query: QuerySpec) -> str:
         return query.query_text
 
+    def _build_tool_call_action_label(self) -> str:
+        if self.use_native_tools:
+            return "native function call"
+        return "<tool_call>"
+
     def _build_tool_call_format_instructions(self) -> str:
+        if self.use_native_tools:
+            return (
+                "Use the native function calling interface — invoke the function directly via the API.\n"
+                "Do NOT wrap tool calls in a <tool_call> XML block.\n"
+                "The available functions are those retrieved in previous <retrieve_tools> steps and\n"
+                "provided to you via the API `tools` parameter after each retrieval."
+            )
         if not self.use_tool_ids:
             return (
                 '<tool_call>\n'
@@ -403,6 +420,11 @@ class EnvRunner:
         )
 
     def _build_tool_call_identifier_rules(self) -> str:
+        if self.use_native_tools:
+            return (
+                "- Call tools by the exact `name` returned in the retrieval result.\n"
+                "- Invoke them as native function calls (not XML tags)."
+            )
         if not self.use_tool_ids:
             return "- Call tools by the exact `name` returned in a retrieval result, and place that value in `name` inside `<tool_call>`."
         return (
@@ -567,12 +589,18 @@ class EnvRunner:
 
         while state.total_step_count < self.config.runtime.max_steps:
             self._mark_turn_pending(query.query_id, next_turn_id, history, state)
+
+            # Build tools list for native mode (only when tools are available)
+            tools_for_api: list[dict[str, Any]] | None = None
+            if self.use_native_tools and state.available_tool_names:
+                tools_for_api = self._to_openai_tools(state.available_tool_names) or None
+
             try:
-                raw_response = self.llm_client.generate(history)
+                llm_response = self.llm_client.generate(history, tools=tools_for_api)
                 if getattr(self.config, "data_collection", None) and self.config.data_collection.enabled:
                     try:
-                        self._log_collection_turn(query, next_turn_id, history, raw_response, state)
-                    except Exception as _e:
+                        self._log_collection_turn(query, next_turn_id, history, llm_response, state)
+                    except Exception:
                         pass  # collection must never break the run
 
             except Exception as exc:
@@ -580,6 +608,19 @@ class EnvRunner:
                 return None
 
             state.total_step_count += 1
+            raw_response = llm_response.content or ""
+
+            # Native tool call path: takes priority over XML parsing
+            if self.use_native_tools and llm_response.tool_calls:
+                final = self._handle_native_tool_calls(
+                    query, llm_response, next_turn_id, state, history
+                )
+                history = final["history"]
+                if final["done"]:
+                    return final["result"]
+                next_turn_id += 1
+                continue
+
             action, content = extract_action(raw_response)
 
             if action is None:
@@ -916,6 +957,134 @@ class EnvRunner:
         )
         return {"done": False, "result": None, "history": history}
 
+    def _handle_native_tool_calls(
+        self,
+        query: QuerySpec,
+        llm_response: LLMResponse,
+        step_id: int,
+        state: AgentState,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Execute tool calls returned via the native OpenAI function-calling interface."""
+        tool_calls = llm_response.tool_calls or []
+        state.tool_call_attempt_count += 1
+
+        # Build the assistant message with native tool_calls
+        assistant_msg: dict[str, Any] = {"role": "assistant"}
+        if llm_response.content:
+            assistant_msg["content"] = llm_response.content
+        assistant_msg["tool_calls"] = tool_calls
+
+        tool_result_messages: list[dict[str, Any]] = []
+        feedbacks: list[str] = []
+        trace_requests: list[dict[str, Any]] = []
+
+        for i, tc in enumerate(tool_calls):
+            tc_id = tc.get("id") or f"call_{step_id}_{i}"
+            function = tc.get("function") or {}
+            tool_name = function.get("name", "")
+            args_str = function.get("arguments") or "{}"
+            try:
+                arguments = json.loads(args_str) if isinstance(args_str, str) else args_str
+            except json.JSONDecodeError:
+                arguments = {}
+
+            normalized_payload = {"name": tool_name, "arguments": arguments}
+            trace_requests.append({"tool_call_id": tc_id, **normalized_payload})
+
+            tool_spec = self.tool_registry.get(tool_name) if isinstance(tool_name, str) else None
+            if tool_name not in state.discovered_tool_names or tool_spec is None:
+                state.call_error_cnt += 1
+                fb = self.prompt_manager.render("error_call_tool_not_available.txt")
+                feedbacks.append(fb)
+                tool_result_messages.append({"role": "tool", "tool_call_id": tc_id, "content": fb})
+                continue
+
+            surface_argument_to_datatype = tool_spec.get("surface_argument_to_datatype") or {}
+            expected_argument_keys = list(surface_argument_to_datatype) if surface_argument_to_datatype else list(
+                ((tool_spec.get("parameters") or {}).get("properties") or {}).keys()
+            )
+            if not expected_argument_keys:
+                expected_argument_keys = list(tool_spec["input_datatypes"])
+
+            expected_inputs = tool_spec["input_datatypes"]
+            if set(arguments) != set(expected_argument_keys):
+                state.call_error_cnt += 1
+                fb = self.prompt_manager.render(
+                    "error_call_wrong_inputs.txt",
+                    tool_name=tool_name,
+                    provided_arguments=list(arguments),
+                )
+                feedbacks.append(fb)
+                tool_result_messages.append({"role": "tool", "tool_call_id": tc_id, "content": fb})
+                continue
+
+            canonical_arguments = {
+                surface_argument_to_datatype.get(k, k): v for k, v in arguments.items()
+            }
+            untrusted_input_datatypes = [
+                dt for dt in expected_inputs
+                if self._is_untrusted_input_value(state, dt, canonical_arguments.get(dt))
+            ]
+            missing_inputs = [dt for dt in expected_inputs if dt not in state.current_datatypes]
+            if untrusted_input_datatypes or missing_inputs:
+                state.call_error_cnt += 1
+                fb = self.prompt_manager.render("error_call_missing_inputs.txt")
+                feedbacks.append(fb)
+                tool_result_messages.append({"role": "tool", "tool_call_id": tc_id, "content": fb})
+                continue
+
+            if self.event_controller.should_block_tool_call(query.query_id, query.task_id, step_id, tool_spec):
+                state.call_error_cnt += 1
+                fb = self.prompt_manager.render("error_call_blocked.txt")
+                feedbacks.append(fb)
+                tool_result_messages.append({"role": "tool", "tool_call_id": tc_id, "content": fb})
+                continue
+
+            execution_result = self.tool_executor.execute_tool(tool_spec, canonical_arguments)
+            state.tool_call_exec_count += 1
+            state.call_error_cnt = 0
+            self._record_execution_output(state, execution_result)
+
+            fb = self._format_tool_feedback(normalized_payload, execution_result)
+            feedbacks.append(fb)
+            tool_result_messages.append({"role": "tool", "tool_call_id": tc_id, "content": fb})
+
+        # Build raw_response string for progress/trace storage
+        raw_response_str = json.dumps(
+            {"tool_calls": tool_calls, "content": llm_response.content},
+            ensure_ascii=False,
+        )
+
+        state.steps_trace.append({
+            "step_id": step_id,
+            "action": "call_tool",
+            "native": True,
+            "parse_ok": True,
+            "requests": trace_requests,
+        })
+
+        new_history = history + [assistant_msg] + tool_result_messages
+        combined_feedback = "\n\n".join(feedbacks) if feedbacks else ""
+
+        self._mark_turn_completed(
+            query.query_id,
+            step_id,
+            raw_response_str,
+            {"action": "call_tool", "parse_ok": True, "native": True, "requests": trace_requests},
+            combined_feedback,
+            state,
+            new_history,
+        )
+
+        if state.call_error_cnt >= self.config.runtime.max_call_errors:
+            return {
+                "done": True,
+                "result": self._finalize_query(query, state, None, "exceeded_max_tool_call_errors"),
+                "history": new_history,
+            }
+        return {"done": False, "result": None, "history": new_history}
+
     def _tool_call_error(
         self,
         query: QuerySpec,
@@ -1031,15 +1200,19 @@ class EnvRunner:
                 ],
             },
         }
-        return (
-            "Retrieved tools for your request. Any tool retrieved earlier in this query remains callable.\n"
-            + ("Use the returned `tool_id` values when you send `<tool_call>`.\n" if self.use_tool_ids else "")
-            + "```json\n"
-            + json.dumps(
-            payload, ensure_ascii=False, indent=2
+        if self.use_native_tools:
+            preamble = (
+                "Retrieved tools for your request. Any tool retrieved earlier in this query remains callable.\n"
+                "These tools are now available to you as native function calls.\n"
             )
-            + "\n```"
-        )
+        elif self.use_tool_ids:
+            preamble = (
+                "Retrieved tools for your request. Any tool retrieved earlier in this query remains callable.\n"
+                "Use the returned `tool_id` values when you send `<tool_call>`.\n"
+            )
+        else:
+            preamble = "Retrieved tools for your request. Any tool retrieved earlier in this query remains callable.\n"
+        return preamble + "```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```"
 
     def _format_tool_feedback(self, request_payload: dict[str, Any], execution_result: Any) -> str:
         tool_name = request_payload.get("name")
@@ -1596,8 +1769,8 @@ class EnvRunner:
         self,
         query: QuerySpec,
         turn_id: int,
-        history: list[dict[str, str]],
-        raw_response: str,
+        history: list[dict[str, Any]],
+        llm_response: LLMResponse,
         state: AgentState,
     ) -> None:
         dc = self.config.data_collection
@@ -1606,12 +1779,38 @@ class EnvRunner:
         if not dc.log_per_turn and not dc.log_full_trajectories:
             return
 
-        messages = [{"role": h.get("role", "user"), "content": h.get("content", "")} for h in history]
-        messages.append({"role": "assistant", "content": raw_response})
+        # Reconstruct history messages in a clean format (preserve tool_calls / tool_call_id)
+        messages: list[dict[str, Any]] = []
+        for h in history:
+            role = h.get("role", "user")
+            if role == "assistant":
+                msg: dict[str, Any] = {"role": "assistant"}
+                if h.get("content") is not None:
+                    msg["content"] = h["content"]
+                if h.get("tool_calls"):
+                    msg["tool_calls"] = h["tool_calls"]
+                messages.append(msg)
+            elif role == "tool":
+                msg = {"role": "tool", "content": h.get("content", "")}
+                if h.get("tool_call_id"):
+                    msg["tool_call_id"] = h["tool_call_id"]
+                messages.append(msg)
+            else:
+                messages.append({"role": role, "content": h.get("content", "")})
 
-        # In native tool mode, include the current tool batch the model had access to.
-        # In prompted mode, the model sees tool schemas embedded in history messages—tools list stays empty.
-        tools = self._to_openai_tools(state.available_tool_names) if dc.use_native_tools else []
+        # Append the current assistant response in native or text format
+        asst_msg: dict[str, Any] = {"role": "assistant"}
+        if llm_response.content is not None:
+            asst_msg["content"] = llm_response.content
+        if llm_response.tool_calls:
+            asst_msg["tool_calls"] = llm_response.tool_calls
+        if "content" not in asst_msg and not asst_msg.get("tool_calls"):
+            asst_msg["content"] = ""
+        messages.append(asst_msg)
+
+        # In native mode include the tool batch the model had available for this turn.
+        use_native = self.use_native_tools or dc.use_native_tools
+        tools = self._to_openai_tools(state.available_tool_names) if use_native else []
 
         record: dict[str, Any] = {
             "turn_id": turn_id,

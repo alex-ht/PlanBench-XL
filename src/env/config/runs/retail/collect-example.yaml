@@ -24,7 +24,7 @@ data_collection:
   enabled: true
   output_subdir: "collect"
   format: "openai_chat"
-  use_native_tools: false
+  use_native_tools: true
   log_per_turn: true
   log_full_trajectories: true
 
@@ -33,6 +33,7 @@ output:
 
 runtime:
   max_steps: 5
+  tool_calling_mode: "native"
 
 logging:
   level: "INFO"

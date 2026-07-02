@@ -16,7 +16,7 @@ import httpx
 import requests
 from openai import OpenAI
 
-from env.core.types import ModelProfile
+from env.core.types import LLMResponse, ModelProfile
 
 
 _CONFIG_ENV_PATH = Path(__file__).resolve().parents[1] / "config" / ".env"
@@ -209,7 +209,7 @@ class LLMClient:
             return None
         return delay
 
-    def _call_with_retries(self, label: str, send: Callable[[], requests.Response | httpx.Response]) -> str:
+    def _call_with_retries(self, label: str, send: Callable[[], requests.Response | httpx.Response]) -> LLMResponse:
         max_attempts = self._max_transport_attempts()
         base_delay = self._retry_base_delay()
         last_error: Exception | None = None
@@ -269,10 +269,14 @@ class LLMClient:
             return json.dumps(parsed, ensure_ascii=False)
         return detail
 
-    def generate(self, history: list[dict[str, str]]) -> str:
+    def generate(
+        self,
+        history: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         provider = self.model.provider
         if provider == "openai":
-            return self._generate_openai(history)
+            return self._generate_openai(history, tools=tools)
         if provider == "anthropic":
             raise RuntimeError(
                 "Anthropic runtime path is not available yet in this environment. "
@@ -285,7 +289,38 @@ class LLMClient:
             )
         raise ValueError(f"Unsupported provider: {provider}")
 
-    def _generate_openai(self, history: list[dict[str, str]]) -> str:
+    @staticmethod
+    def _build_messages_for_api(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert internal history to API messages, preserving native tool_calls fields."""
+        messages: list[dict[str, Any]] = []
+        for item in history:
+            role = item.get("role", "user")
+            if role == "assistant":
+                msg: dict[str, Any] = {"role": "assistant"}
+                content = item.get("content")
+                if content is not None:
+                    msg["content"] = content
+                tool_calls = item.get("tool_calls")
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                if "content" not in msg and not tool_calls:
+                    msg["content"] = ""
+                messages.append(msg)
+            elif role == "tool":
+                msg = {"role": "tool", "content": item.get("content", "")}
+                tool_call_id = item.get("tool_call_id")
+                if tool_call_id:
+                    msg["tool_call_id"] = tool_call_id
+                messages.append(msg)
+            else:
+                messages.append({"role": role, "content": item.get("content", "")})
+        return messages
+
+    def _generate_openai(
+        self,
+        history: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         auth = self.model.auth
         api_key = self._resolve_api_key(auth)
         base_url = self._resolve_base_url(auth)
@@ -294,12 +329,12 @@ class LLMClient:
         transport = self._raw_chat_completions_transport(base_url)
         if self.model.api_style == "chat_completions" and transport == "requests":
             token_param = self.model.capabilities.get("chat_completion_token_param", "max_tokens")
-            messages = [{"role": item["role"], "content": item["content"]} for item in history]
-            return self._generate_openai_chat_completions_via_requests(messages, token_param)
+            messages = self._build_messages_for_api(history)
+            return self._generate_openai_chat_completions_via_requests(messages, token_param, tools=tools)
         if self.model.api_style == "chat_completions" and transport == "httpx":
             token_param = self.model.capabilities.get("chat_completion_token_param", "max_tokens")
-            messages = [{"role": item["role"], "content": item["content"]} for item in history]
-            return self._generate_openai_chat_completions_via_httpx(messages, token_param)
+            messages = self._build_messages_for_api(history)
+            return self._generate_openai_chat_completions_via_httpx(messages, token_param, tools=tools)
 
         client_kwargs: dict[str, Any] = {
             "api_key": api_key,
@@ -316,13 +351,13 @@ class LLMClient:
         if self.model.api_style == "responses":
             return self._generate_openai_responses(client, history)
         if self.model.api_style == "chat_completions":
-            return self._generate_openai_chat_completions(client, history)
+            return self._generate_openai_chat_completions(client, history, tools=tools)
         raise ValueError(f"Unsupported OpenAI api_style: {self.model.api_style}")
 
-    def _generate_openai_responses(self, client: OpenAI, history: list[dict[str, str]]) -> str:
+    def _generate_openai_responses(self, client: OpenAI, history: list[dict[str, Any]]) -> LLMResponse:
         request_kwargs: dict[str, Any] = {
             "model": self.model.model_name,
-            "input": [{"role": item["role"], "content": item["content"]} for item in history],
+            "input": [{"role": item["role"], "content": item.get("content", "")} for item in history],
             "max_output_tokens": self.model.request.max_tokens,
         }
         if self.model.request.temperature is not None and not self._responses_model_disallows_temperature():
@@ -332,17 +367,22 @@ class LLMClient:
             request_kwargs["reasoning"] = reasoning
 
         response = client.responses.create(**request_kwargs)
-        return response.output_text
+        return LLMResponse(content=response.output_text)
 
-    def _generate_openai_chat_completions(self, client: OpenAI, history: list[dict[str, str]]) -> str:
+    def _generate_openai_chat_completions(
+        self,
+        client: OpenAI,
+        history: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         token_param = self.model.capabilities.get("chat_completion_token_param", "max_tokens")
-        messages = [{"role": item["role"], "content": item["content"]} for item in history]
+        messages = self._build_messages_for_api(history)
         base_url = self._resolve_base_url(self.model.auth)
         transport = self._raw_chat_completions_transport(base_url)
         if transport == "requests":
-            return self._generate_openai_chat_completions_via_requests(messages, token_param)
+            return self._generate_openai_chat_completions_via_requests(messages, token_param, tools=tools)
         if transport == "httpx":
-            return self._generate_openai_chat_completions_via_httpx(messages, token_param)
+            return self._generate_openai_chat_completions_via_httpx(messages, token_param, tools=tools)
         request_kwargs: dict[str, Any] = {
             "model": self.model.model_name,
             "messages": messages,
@@ -354,18 +394,41 @@ class LLMClient:
         extra_body = self._build_openai_chat_extra_body()
         if extra_body is not None:
             request_kwargs["extra_body"] = extra_body
+        if tools:
+            request_kwargs["tools"] = tools
+            request_kwargs["tool_choice"] = "auto"
         response = client.chat.completions.create(**request_kwargs)
-        message = response.choices[0].message.content
-        if isinstance(message, str):
-            return message
-        if isinstance(message, list):
+        msg = response.choices[0].message
+
+        # Normalise content: SDK returns str | None; some providers return a list of blocks.
+        raw_content = msg.content
+        if isinstance(raw_content, list):
             parts = []
-            for item in message:
-                text = getattr(item, "text", None)
+            for block in raw_content:
+                text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
                 if text:
-                    parts.append(text)
-            return "\n".join(parts)
-        raise RuntimeError("OpenAI chat.completions returned an empty assistant message.")
+                    parts.append(str(text))
+            content: str | None = "\n".join(parts) if parts else None
+        else:
+            content = raw_content  # str or None
+
+        tool_calls_raw: list[dict[str, Any]] | None = None
+        if msg.tool_calls:
+            tool_calls_raw = [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+
+        if content is None and not tool_calls_raw:
+            raise RuntimeError("OpenAI chat.completions returned an empty assistant message.")
+        return LLMResponse(content=content, tool_calls=tool_calls_raw)
 
     def _resolve_api_key(self, auth: Any) -> str:
         if auth.api_key:
@@ -455,8 +518,9 @@ class LLMClient:
 
     def _build_raw_chat_completions_payload(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         token_param: str,
+        tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model.model_name,
@@ -469,6 +533,9 @@ class LLMClient:
         extra_body = self._build_openai_chat_extra_body()
         if extra_body is not None:
             payload.update(extra_body)
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         return payload
 
     def _build_raw_chat_completions_headers(self, auth: Any) -> dict[str, str]:
@@ -511,15 +578,16 @@ class LLMClient:
 
     def _generate_openai_chat_completions_via_httpx(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         token_param: str,
-    ) -> str:
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         auth = self.model.auth
         base_url = self._resolve_base_url(auth)
         if not base_url:
             raise RuntimeError("Missing base_url for httpx chat completions fallback.")
 
-        payload = self._build_raw_chat_completions_payload(messages, token_param)
+        payload = self._build_raw_chat_completions_payload(messages, token_param, tools=tools)
         headers = self._build_raw_chat_completions_headers(auth)
         url = self._build_raw_chat_completions_url(base_url)
         verify_ssl = self._raw_chat_completions_verify_ssl()
@@ -533,15 +601,16 @@ class LLMClient:
 
     def _generate_openai_chat_completions_via_requests(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         token_param: str,
-    ) -> str:
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         auth = self.model.auth
         base_url = self._resolve_base_url(auth)
         if not base_url:
             raise RuntimeError("Missing base_url for requests chat completions transport.")
 
-        payload = self._build_raw_chat_completions_payload(messages, token_param)
+        payload = self._build_raw_chat_completions_payload(messages, token_param, tools=tools)
         headers = self._build_raw_chat_completions_headers(auth)
         url = self._build_raw_chat_completions_url(base_url)
         verify_ssl = self._raw_chat_completions_verify_ssl()
@@ -552,7 +621,7 @@ class LLMClient:
 
         return self._call_with_retries(f"requests {url}", _send)
 
-    def _parse_raw_chat_completions_response(self, response: httpx.Response | requests.Response) -> str:
+    def _parse_raw_chat_completions_response(self, response: httpx.Response | requests.Response) -> LLMResponse:
         if response.status_code >= 400:
             detail = response.text.strip()
             try:
@@ -581,9 +650,8 @@ class LLMClient:
         message = first_choice.get("message")
         if not isinstance(message, dict):
             raise RuntimeError("chat.completions message is missing or invalid.")
+
         content = message.get("content")
-        if isinstance(content, str):
-            return content
         if isinstance(content, list):
             parts: list[str] = []
             for item in content:
@@ -591,6 +659,13 @@ class LLMClient:
                     text = item.get("text")
                     if isinstance(text, str):
                         parts.append(text)
-            if parts:
-                return "\n".join(parts)
-        raise RuntimeError("chat.completions returned an empty assistant message.")
+            content = "\n".join(parts) if parts else None
+
+        tool_calls_raw: list[dict[str, Any]] | None = None
+        raw_tool_calls = message.get("tool_calls")
+        if isinstance(raw_tool_calls, list) and raw_tool_calls:
+            tool_calls_raw = [tc for tc in raw_tool_calls if isinstance(tc, dict)]
+
+        if content is None and not tool_calls_raw:
+            raise RuntimeError("chat.completions returned an empty assistant message.")
+        return LLMResponse(content=content, tool_calls=tool_calls_raw)
